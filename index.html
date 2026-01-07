@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Voice Agent</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; max-width: 800px; margin: 50px auto; padding: 20px; }
+        #status { font-size: 20px; margin: 20px; font-weight: bold; }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; }
+        #transcripts { margin-top: 30px; text-align: left; max-height: 400px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; border-radius: 5px; }
+        .transcript-item { margin: 10px 0; padding: 10px; background: #f5f5f5; border-radius: 5px; }
+        .transcript-user { background: #e3f2fd; }
+        .transcript-bot { background: #f1f8e9; }
+        .transcript-label { font-weight: bold; margin-bottom: 5px; }
+    </style>
+</head>
+<body>
+    <h1>WebRTC Voice Agent</h1>
+    <p id="status">Disconnected</p>
+    <button id="connect-btn">Connect</button>
+    <audio id="audio-el" autoplay></audio>
+    <div id="transcripts-container" style="display: none;">
+        <h2>Transcripts</h2>
+        <div id="transcripts"></div>
+    </div>
+
+    <script>
+        const statusEl = document.getElementById("status")
+        const buttonEl = document.getElementById("connect-btn")
+        const audioEl = document.getElementById("audio-el")
+        const transcriptsEl = document.getElementById("transcripts")
+        const transcriptsContainer = document.getElementById("transcripts-container")
+
+        let connected = false
+        let peerConnection = null
+        
+        const addTranscript = (text, isUser) => {
+            if (!text) return;
+            const transcriptItem = document.createElement('div');
+            transcriptItem.className = `transcript-item ${isUser ? 'transcript-user' : 'transcript-bot'}`;
+            transcriptItem.innerHTML = `
+                <div class="transcript-label">${isUser ? '👤 You' : '🤖 Bot'}</div>
+                <div>${text}</div>
+            `;
+            transcriptsEl.appendChild(transcriptItem);
+            transcriptsEl.scrollTop = transcriptsEl.scrollHeight;
+            transcriptsContainer.style.display = 'block';
+        }
+
+        const sendIceCandidate = async (pc, candidate) => {
+            try {
+                if (!candidate.candidate || candidate.candidate.trim() === '') {
+                    console.warn('Skipping invalid ICE candidate: empty candidate string');
+                    return;
+                }
+                await fetch('/api/offer', {
+                  method: "PATCH",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    pc_id: pc.pc_id,
+                    candidates:[{
+                        candidate: candidate.candidate,
+                        sdp_mid: candidate.sdpMid,
+                        sdp_mline_index: candidate.sdpMLineIndex
+                    }]
+                  })
+                });
+            } catch (error) {
+                console.error('❌ Error sending ICE candidate:', error);
+            }
+        };
+
+        const createSmallWebRTCConnection = async (audioTrack) => {
+            const config = {
+              iceServers:[
+                {
+                  urls:"stun:stun.l.google.com:19302",
+                }
+              ]
+            };
+            const pc = new RTCPeerConnection(config)
+            
+            // Queue to store ICE candidates until we have received the answer and have a session in progress
+            pc.pendingIceCandidates = []
+            pc.canSendIceCandidates = false
+            
+            // Create data channel (CLIENT must create it for SmallWebRTC!)
+            const dataChannel = pc.createDataChannel('data', { ordered: true });
+            dataChannel.onopen = () => {
+                console.log('✅ Data channel opened - ready for transcripts!');
+            };
+            dataChannel.onmessage = (event) => {
+                try {
+                    const message = JSON.parse(event.data);
+                    console.log('📨 Received message:', message);
+                    // Handle RTVI messages for transcription display
+                    if (message.label === 'rtvi-ai' && message.type === 'user-transcription') {
+                        const text = message.data?.text || message.text || message.transcript;
+                        if (text && message.data?.final !== false) {
+                            console.log('📝 User transcription:', text);
+                            addTranscript(text, true);
+                        }
+                    } else if (message.label === 'rtvi-ai' && message.type === 'bot-transcription') {
+                        const text = message.data?.text || message.text || message.transcript;
+                        if (text) {
+                            console.log('📝 Bot transcription:', text);
+                            addTranscript(text, false);
+                        }
+                    } else if (message.label === 'rtvi-ai' && message.type === 'tts-text') {
+                        const text = message.data?.text || message.text;
+                        if (text) {
+                            console.log('📝 TTS text:', text);
+                            addTranscript(text, false);
+                        }
+                    } else if (message.type === 'user-transcription') {
+                        const text = message.data?.text || message.text || message.transcript;
+                        if (text && message.data?.final !== false) {
+                            addTranscript(text, true);
+                        }
+                    } else if (message.type === 'bot-transcription') {
+                        const text = message.data?.text || message.text || message.transcript;
+                        if (text) {
+                            addTranscript(text, false);
+                        }
+                    }
+                } catch (error) {
+                    console.error('❌ Error parsing message:', error);
+                    console.log('Raw message:', event.data);
+                }
+            };
+            dataChannel.onerror = (error) => {
+                console.error('❌ Data channel error:', error);
+            };
+            dataChannel.onclose = () => {
+                console.log('🔌 Data channel closed');
+            };
+            
+            addPeerConnectionEventListeners(pc)
+            pc.ontrack = (e) => {
+                console.log('🎵 Received track:', e.track.kind);
+                if (e.track.kind === 'audio') {
+                    audioEl.srcObject = e.streams[0];
+                    console.log('🔊 Audio track connected to audio element');
+                }
+            }
+            // SmallWebRTCTransport expects to receive both transceivers
+            pc.addTransceiver(audioTrack, { direction: 'sendrecv' })
+            pc.addTransceiver('video', { direction: 'sendrecv' })
+            await pc.setLocalDescription(await pc.createOffer())
+            const offer = pc.localDescription
+            console.log('📤 Sending offer to server...');
+            const response = await fetch('/api/offer', {
+                body: JSON.stringify({ sdp: offer.sdp, type: offer.type}),
+                headers: { 'Content-Type': 'application/json' },
+                method: 'POST',
+            });
+            
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`Server error: ${response.status} ${response.statusText} - ${errorText}`);
+            }
+            
+            const answer = await response.json()
+            console.log('📥 Received answer from server:', answer);
+            if (!answer.pc_id) {
+                throw new Error('Server response missing pc_id');
+            }
+            pc.pc_id = answer.pc_id
+            await pc.setRemoteDescription(answer)
+            
+            // Now we can send ICE candidates
+            pc.canSendIceCandidates = true
+            
+            // Send any queued ICE candidates
+            for (const candidate of pc.pendingIceCandidates) {
+                await sendIceCandidate(pc, candidate)
+            }
+            pc.pendingIceCandidates = []
+            
+            return pc
+        }
+
+        const connect = async () => {
+            try {
+                _onConnecting()
+                
+                // Check if getUserMedia is available
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    const isLocalhost = window.location.hostname === 'localhost' || 
+                                       window.location.hostname === '127.0.0.1' ||
+                                       window.location.hostname === '';
+                    const isHttps = window.location.protocol === 'https:';
+                    
+                    if (!isLocalhost && !isHttps) {
+                        throw new Error('getUserMedia requires HTTPS. Please access this page via HTTPS or use localhost.');
+                    } else {
+                        throw new Error('getUserMedia is not supported in this browser. Please use a modern browser like Chrome, Firefox, or Edge.');
+                    }
+                }
+                
+                console.log('🎤 Requesting microphone access...');
+                const audioStream = await navigator.mediaDevices.getUserMedia({audio: true})
+                console.log('✅ Microphone access granted');
+                peerConnection = await createSmallWebRTCConnection(audioStream.getAudioTracks()[0])
+                console.log('✅ WebRTC connection created');
+            } catch (error) {
+                console.error('❌ Connection error:', error);
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                alert(`Connection failed: ${errorMessage}`);
+                _onDisconnected()
+            }
+        }
+
+        const addPeerConnectionEventListeners = (pc) => {
+            pc.oniceconnectionstatechange = () => {
+                console.log("oniceconnectionstatechange", pc?.iceConnectionState)
+            }
+            pc.onconnectionstatechange = () => {
+                console.log("onconnectionstatechange", pc?.connectionState)
+                let connectionState = pc?.connectionState
+                if (connectionState === 'connected') {
+                    _onConnected()
+                } else if (connectionState === 'disconnected') {
+                    _onDisconnected()
+                }
+            }
+            pc.onicecandidate = async (event) => {
+                if (event.candidate) {
+                    console.log("🧊 New ICE candidate:", event.candidate.candidate.substring(0, 50) + '...');
+                    // Check if we can send ICE candidates (we have received the answer with pc_id)
+                    if (pc.canSendIceCandidates && pc.pc_id) {
+                        // Send immediately
+                        await sendIceCandidate(pc, event.candidate)
+                    } else {
+                        // Queue the candidate until we have pc_id
+                        pc.pendingIceCandidates.push(event.candidate)
+                    }
+                } else {
+                    console.log("✅ All ICE candidates have been sent.");
+                }
+            };
+        }
+
+        const _onConnecting = () => {
+            statusEl.textContent = "Connecting"
+            statusEl.style.color = 'blue'
+            buttonEl.textContent = "Disconnect"
+            connected = true
+        }
+
+        const _onConnected = () => {
+            statusEl.textContent = "Connected"
+            statusEl.style.color = 'green'
+            buttonEl.textContent = "Disconnect"
+            connected = true
+        }
+
+        const _onDisconnected = () => {
+            statusEl.textContent = "Disconnected"
+            statusEl.style.color = 'black'
+            buttonEl.textContent = "Connect"
+            connected = false
+            if (peerConnection) {
+                peerConnection = null
+            }
+        }
+
+        const disconnect = () => {
+            if (!peerConnection) {
+                return
+            }
+            peerConnection.close()
+            peerConnection = null
+            _onDisconnected()
+        }
+
+        // Check API availability on page load
+        window.addEventListener('load', () => {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                const isLocalhost = window.location.hostname === 'localhost' || 
+                                   window.location.hostname === '127.0.0.1' ||
+                                   window.location.hostname === '';
+                const isHttps = window.location.protocol === 'https:';
+                
+                if (!isLocalhost && !isHttps) {
+                    statusEl.textContent = "⚠️ HTTPS Required";
+                    statusEl.style.color = 'red';
+                    alert('⚠️ This page requires HTTPS to access your microphone.\n\n' +
+                          'Please access this page via:\n' +
+                          '- https://localhost:7860 (if using HTTPS)\n' +
+                          '- http://localhost:7860 (localhost works with HTTP)\n\n' +
+                          'Or set up HTTPS for your server.');
+                } else {
+                    statusEl.textContent = "⚠️ Browser Not Supported";
+                    statusEl.style.color = 'red';
+                    alert('⚠️ Your browser does not support getUserMedia.\n\n' +
+                          'Please use a modern browser like:\n' +
+                          '- Google Chrome\n' +
+                          '- Mozilla Firefox\n' +
+                          '- Microsoft Edge\n' +
+                          '- Safari (macOS/iOS)');
+                }
+            }
+        });
+
+        buttonEl.addEventListener("click", async () => {
+            if (!connected) {
+                await connect()
+            } else {
+                disconnect()
+            }
+        });
+    </script>
+</body>
+</html>
