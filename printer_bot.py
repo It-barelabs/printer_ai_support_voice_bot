@@ -8,11 +8,12 @@
 #
 import os
 import sys
+import asyncio
 
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import LLMRunFrame
+from pipecat.frames.frames import LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMRunFrame, LLMTextFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -22,26 +23,54 @@ from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIPro
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.google import GeminiLiveVertexLLMService, GoogleVertexLLMService
-from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
+# from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+
+from gemini_bridge import GeminiVertexBridge
+from langgraph_bridge import LangGraphBridge
+from support_graph import app as support_graph
+import logging
+
+# Configure logging
+logging.getLogger("pipecat.transports.smallwebrtc").setLevel(logging.WARNING)
+logging.getLogger("langgraph_bridge").setLevel(logging.INFO)
+logging.getLogger("support_graph").setLevel(logging.INFO)
 
 load_dotenv(override=True)
 
 SYSTEM_INSTRUCTION = f"""
-"You are Gemini Chatbot, a friendly, helpful robot.
-
-Your goal is to demonstrate your capabilities in a succinct way.
+"You are Printer support Chatbot "Easy print", a friendly, helpful support bot that help users solve issues with their printer.
 
 Your output will be converted to audio so don't include special characters in your answers.
 
 Respond to what the user said in a creative and helpful way. Keep your responses brief. One or two sentences at most.
 """
 
+    
+
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.frames.frames import (
+    TextFrame,
+    TranscriptionFrame,
+    Frame,
+    InterimTranscriptionFrame,
+    StartFrame,
+    LLMContextFrame,
+    LLMRunFrame
+)
+from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContextFrame
+
+
+
+
 
 async def run_bot(webrtc_connection):
     logger.info("🚀 Starting bot with WebRTC connection")
     logger.info(f"🔧 WebRTC connection ID: {webrtc_connection.pc_id}")
+
+    # if printer_info:
+    #     logger.info(f"🖨️ Printer info received: {printer_info}")
 
     pipecat_transport = SmallWebRTCTransport(
         webrtc_connection=webrtc_connection,
@@ -64,9 +93,22 @@ async def run_bot(webrtc_connection):
             api_key=os.getenv("ELEVENLABS_API_KEY", ""),
             voice_id=os.getenv("ELEVENLABS_VOICE_ID", ""),
             params=ElevenLabsTTSService.InputParams(
-        output_format="pcm_16000" # 16kHz with 320 samples per buffer (20ms chunks)
-    )
+                output_format="pcm_16000" # 16kHz with 320 samples per buffer (20ms chunks)
+            )
         )
+    # Initialize LangGraphBridge with proper state schema
+    initial_state = {
+        "messages": [],
+        "topic": "",
+        "tone": "",
+        "audience": "",
+        "word_count": 0,
+        "thesis_statement": "",
+        "outline": "",
+        "final_draft": "",
+        "current_stage": "intake"
+    }
+    # bridge = LangGraphBridge(app=support_graph, thread_id="session_01", initial_state=initial_state)
 
     # llm = GeminiLiveVertexLLMService(project_id="voice-document-builder", location="global",
     #     voice_id="Puck",  # Aoede, Charon, Fenrir, Kore, Puck
@@ -74,13 +116,20 @@ async def run_bot(webrtc_connection):
     #     system_instruction=SYSTEM_INSTRUCTION,
     # )
 
-    llm = GoogleVertexLLMService(project_id="voice-document-builder", location="global")
+    # llm = GoogleVertexLLMService(project_id="voice-document-builder", location="global")
+    # llm = GeminiVertexBridge(project_id="voice-document-builder", location="global", model="gemini-2.5-flash", system_instruction=SYSTEM_INSTRUCTION)
+
+    bridge = LangGraphBridge(app=support_graph, thread_id="session_01", initial_state=initial_state)
+
+    system_content = "Start by greeting the user warmly and introducing yourself. use short response if possible and be friendly and helpful."
+    # if printer_info:
+    #     system_content += f"\n\nHere is information about the printer:\n{printer_info}"
 
     context = LLMContext(
         [
             {
-                "role": "user",
-                "content": "Start by greeting the user warmly and introducing yourself.",
+                "role": "system",
+                "content": system_content,
             }
         ],
     )
@@ -88,19 +137,20 @@ async def run_bot(webrtc_connection):
 
     # Add RTVI processor for sending transcripts to the client
     # RTVI uses an observer pattern to capture frames from anywhere in the pipeline
-    # It needs to be in the pipeline and have access to the transport for SmallWebRTC
+    # We pass transport so it can send messages to the client
     rtvi = RTVIProcessor(
         config=RTVIConfig(config=[]),
-        transport=pipecat_transport  # Pass transport so RTVI can send via data channel
+        # transport=pipecat_transport
     )
-
+    
     pipeline = Pipeline(
         [
             pipecat_transport.input(),
+            rtvi,
             stt,  # Speech-to-text: transcribes user audio
-            rtvi,  # RTVI processor - observer will capture STT transcriptions and TTS text
             context_aggregator.user(),
-            llm,  # LLM
+            bridge,  
+            # llm,
             tts,  # Text-to-speech: generates bot audio
             pipecat_transport.output(),
             context_aggregator.assistant(),

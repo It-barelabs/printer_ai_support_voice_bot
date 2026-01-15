@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 from printer_bot import run_bot
 from dotenv import load_dotenv
+from typing import Optional
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import FileResponse
 from loguru import logger
@@ -37,7 +38,7 @@ app = FastAPI(lifespan=lifespan)
 
 
 @app.post("/api/offer")
-async def offer(request: SmallWebRTCRequest, background_tasks: BackgroundTasks):
+async def offer(request: SmallWebRTCRequest, background_tasks: BackgroundTasks, printer_info: Optional[str] = None):
     """Handle WebRTC offer requests via SmallWebRTCRequestHandler."""
 
     # Prepare runner arguments with the callback to run your bot
@@ -75,10 +76,10 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", "-v", action="count")
     args = parser.parse_args()
 
-    # logger.remove(0)
+    logger.remove(0)
     if args.verbose:
         logger.add(sys.stderr, level="TRACE")
     else:
         logger.add(sys.stderr, level="DEBUG")
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run("server:app", host=args.host, port=args.port, reload=True)

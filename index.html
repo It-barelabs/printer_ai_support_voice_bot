@@ -18,6 +18,9 @@
 <body>
     <h1>WebRTC Voice Agent</h1>
     <p id="status">Disconnected</p>
+    <!-- <div style="margin: 20px 0;">
+        <textarea id="printer-info" placeholder="Enter printer information here..." rows="4" style="width: 100%; max-width: 500px; padding: 10px; border-radius: 5px; border: 1px solid #ccc;"></textarea>
+    </div> -->
     <button id="connect-btn">Connect</button>
     <audio id="audio-el" autoplay></audio>
     <div id="transcripts-container" style="display: none;">
@@ -28,6 +31,7 @@
     <script>
         const statusEl = document.getElementById("status")
         const buttonEl = document.getElementById("connect-btn")
+        // const printerInfoEl = document.getElementById("printer-info")
         const audioEl = document.getElementById("audio-el")
         const transcriptsEl = document.getElementById("transcripts")
         const transcriptsContainer = document.getElementById("transcripts-container")
@@ -113,6 +117,12 @@
                             console.log('📝 TTS text:', text);
                             addTranscript(text, false);
                         }
+                    } else if (message.label === 'rtvi-ai' && message.type === 'bot-llm-text') {
+                        const text = message.data?.text || message.text;
+                        if (text) {
+                            console.log('📝 Bot LLM text:', text);
+                            addTranscript(text, false);
+                        }
                     } else if (message.type === 'user-transcription') {
                         const text = message.data?.text || message.text || message.transcript;
                         if (text && message.data?.final !== false) {
@@ -150,7 +160,16 @@
             await pc.setLocalDescription(await pc.createOffer())
             const offer = pc.localDescription
             console.log('📤 Sending offer to server...');
-            const response = await fetch('/api/offer', {
+            
+            // const printerInfo = printerInfoEl.value;
+            let url = '/api/offer';
+            // if (printerInfo) {
+            //     const params = new URLSearchParams();
+            //     params.append('printer_info', printerInfo);
+            //     url += `?${params.toString()}`;
+            // }
+
+            const response = await fetch(url, {
                 body: JSON.stringify({ sdp: offer.sdp, type: offer.type}),
                 headers: { 'Content-Type': 'application/json' },
                 method: 'POST',
