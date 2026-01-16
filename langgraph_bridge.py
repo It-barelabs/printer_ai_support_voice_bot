@@ -1,89 +1,28 @@
 import asyncio
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.frames.frames import (
-    InputAudioRawFrame,
-    OutputAudioRawFrame,
-    TextFrame,
-    LLMMessagesFrame,
     Frame,
-    EndFrame,
-    StartFrame,
-    InterimTranscriptionFrame,
-    TranscriptionFrame,
-    LLMRunFrame,
     LLMFullResponseStartFrame,
     LLMFullResponseEndFrame,
     LLMTextFrame,
     LLMContextFrame
 )
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContextFrame
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import AIMessage
 import logging
 from loguru import logger
 
 logging.getLogger("pipecat.transports.smallwebrtc").setLevel(logging.WARNING)
 
 
-class LangGraphProcessor(FrameProcessor):
-    def __init__(self, graph, thread_id: str = "default_thread"):
-        super().__init__()
-        self.graph = graph
-        # LangGraph config for persistent state
-        self.config = {"configurable": {"thread_id": thread_id}}
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """
-        Standard Pipecat method to intercept frames in the pipeline.
-        """
-
-        await super().process_frame(frame, direction)
-
-        # 1. Ignore raw audio frames - LangGraph doesn't need them
-        if isinstance(frame, (InputAudioRawFrame, OutputAudioRawFrame)):
-            await self.push_frame(frame, direction)
-            return
-        # 1. Detect when the user has finished speaking
-        if isinstance(frame, LLMMessagesFrame):
-            # Pipecat's ContextAggregator sends this frame when VAD detects silence
-            messages = frame.messages
-            if not messages:
-                return
-            
-            # Get the last user message from the Pipecat context
-            last_msg = messages[-1]
-            if last_msg["role"] != "user":
-                return
-
-            user_input = last_msg["content"]
-            print(f"🎤 User said: {user_input}")
-
-            # 2. Invoke LangGraph
-            # stream_mode="messages" is crucial for low-latency voice
-            async for chunk in self.graph.astream(
-                {"messages": [HumanMessage(content=user_input)]},
-                self.config,
-                stream_mode="messages"
-            ):
-                # 3. Convert LangGraph chunks -> Pipecat TextFrames
-                if isinstance(chunk, tuple):
-                    msg_chunk, _ = chunk
-                    # Ensure we only speak the AI's content
-                    if isinstance(msg_chunk, AIMessage) and msg_chunk.content:
-                        await self.push_frame(TextFrame(text=msg_chunk.content))
-            
-        # Pass other system frames (EndFrame, etc.) through untouched
-        elif isinstance(frame, (EndFrame, StartFrame)):
-            await self.push_frame(frame, direction)
-        else:
-            await self.push_frame(frame, direction)
-
-
 class LangGraphBridge(FrameProcessor):
-    def __init__(self, app, thread_id: str, initial_state: dict = None):
+    def __init__(self, app, thread_id: str, initial_state: dict = None, transport=None, webrtc_connection=None):
         super().__init__()
         self.app = app
         self.thread_id = thread_id
         self.config = {"configurable": {"thread_id": thread_id}}
+        self.transport = transport
+        self.webrtc_connection = webrtc_connection
         # Initialize current_state with the provided initial_state or default
         self.current_state = initial_state or {
             "messages": [],
@@ -96,18 +35,6 @@ class LangGraphBridge(FrameProcessor):
             "final_draft": "",
             "current_stage": "intake"
         }
-        # Print initial state structure
-        print("\n" + "="*80)
-        print("📊 LangGraph Bridge Initial State Structure:")
-        print("="*80)
-        for key, value in self.current_state.items():
-            if isinstance(value, list):
-                print(f"  {key}: list (length: {len(value)})")
-            elif isinstance(value, dict):
-                print(f"  {key}: dict (keys: {list(value.keys())})")
-            else:
-                print(f"  {key}: {type(value).__name__} = {value}")
-        print("="*80 + "\n")
 
     def _extract_text_from_message(self, message):
         """Extract text content from various message formats."""
@@ -196,6 +123,91 @@ class LangGraphBridge(FrameProcessor):
         
         return state, has_user_message
 
+    def _format_final_result_for_display(self, final_result):
+        """Format final_result dict as a readable string for display."""
+        lines = []
+        lines.append("Final State Structure:")
+        lines.append("-" * 80)
+        for key, value in final_result.items():
+            if isinstance(value, list):
+                lines.append(f"  {key}: list (length: {len(value)})")
+                if value and len(value) <= 3:
+                    for i, item in enumerate(value):
+                        if isinstance(item, str):
+                            item_str = item[:50] + "..." if len(item) > 50 else item
+                        else:
+                            item_str = str(item)[:50] + "..." if len(str(item)) > 50 else str(item)
+                        lines.append(f"    [{i}]: {item_str}")
+            elif isinstance(value, dict):
+                lines.append(f"  {key}: dict (keys: {list(value.keys())})")
+            else:
+                value_str = str(value)
+                if len(value_str) > 100:
+                    value_str = value_str[:100] + "..."
+                lines.append(f"  {key}: {value_str}")
+        lines.append("-" * 80)
+        return "\n".join(lines)
+    
+    def _format_final_result_as_json(self, final_result):
+        """Format final_result as JSON string for webpage."""
+        import json
+        # Convert to serializable format
+        serializable_result = {}
+        for key, value in final_result.items():
+            if isinstance(value, (str, int, float, bool, type(None))):
+                serializable_result[key] = value
+            elif isinstance(value, list):
+                # Convert list items to strings if needed
+                serializable_result[key] = [
+                    str(item) if not isinstance(item, (str, int, float, bool, type(None))) else item
+                    for item in value[:10]  # Limit to first 10 items
+                ]
+            elif isinstance(value, dict):
+                serializable_result[key] = {k: str(v) for k, v in value.items()}
+            else:
+                serializable_result[key] = str(value)
+        
+        try:
+            return json.dumps(serializable_result, indent=2)
+        except Exception as e:
+            logger.error(f"Error serializing final_result: {e}")
+            return str(serializable_result)
+    
+    async def _send_final_result_to_webpage(self, final_result):
+        """Send final_result to webpage via data channel.
+        This method is non-blocking and won't break the pipeline if it fails.
+        """
+        try:
+            if not self.webrtc_connection:
+                return
+            
+            import json
+            final_result_json = self._format_final_result_as_json(final_result)
+            final_result_str = self._format_final_result_for_display(final_result)
+            final_result_dict = json.loads(final_result_json)
+            
+            message = {
+                "label": "langgraph-bridge",
+                "type": "final-result",
+                "data": {
+                    "final_result": final_result_dict,
+                    "formatted": final_result_str
+                }
+            }
+            
+            if hasattr(self.webrtc_connection, 'send_app_message'):
+                self.webrtc_connection.send_app_message(message)
+                return
+            
+            # Fallback: try transport._webrtc_connection
+            if hasattr(self.transport, '_webrtc_connection') and self.transport._webrtc_connection:
+                if hasattr(self.transport._webrtc_connection, 'send_app_message'):
+                    self.transport._webrtc_connection.send_app_message(message)
+                    return
+            
+        except Exception as e:
+            logger.debug(f"Error sending final_result to webpage (non-fatal): {e}")
+
     async def _process_context(self, context):
         """
         Process a context and generate a response.
@@ -210,51 +222,24 @@ class LangGraphBridge(FrameProcessor):
             # Convert context to LangGraph state
             state, has_user_message = self._convert_context_to_langgraph_state(context)
             
-            logger.info(f"🔍 Converted context: has_user_message={has_user_message}, state keys: {list(state.keys())}")
-            
             if not has_user_message:
-                logger.debug("No user message in context, skipping")
                 await self.push_frame(LLMFullResponseEndFrame())
                 return
-            
-            logger.info(f"🎤 Processing context with state: {state.get('messages', [])}")
             
             # Update current state
             self.current_state = state
             
-            # Get final result from LangGraph (no streaming, wait for complete response)
-            logger.info(f"🚀 Calling LangGraph (waiting for final result)")
-            
+            # Get final result from LangGraph
             try:
                 if hasattr(self.app, 'ainvoke'):
                     final_result = await self.app.ainvoke(state, self.config)
                 else:
-                    import asyncio
                     final_result = await asyncio.to_thread(self.app.invoke, state, self.config)
                 
-                # Print the returned state structure
-                print("\n" + "="*80)
-                print("📊 LangGraph Bridge Final State Structure (returned from graph):")
-                print("="*80)
-                for key, value in final_result.items():
-                    if isinstance(value, list):
-                        print(f"  {key}: list (length: {len(value)})")
-                        if value and len(value) <= 5:
-                            print(f"    Contents: {value}")
-                    elif isinstance(value, dict):
-                        print(f"  {key}: dict (keys: {list(value.keys())})")
-                    else:
-                        value_str = str(value)
-                        if len(value_str) > 100:
-                            value_str = value_str[:100] + "..."
-                        print(f"  {key}: {type(value).__name__} = {value_str}")
-                print("="*80 + "\n")
-                
-                # Extract only the last message from the messages list
+                # Extract the last message from the messages list for TTS
                 bot_response_text = None
                 if "messages" in final_result and final_result["messages"]:
                     messages = final_result["messages"]
-                    # Get the last message (should be the bot's response)
                     last_msg = messages[-1]
                     
                     # Extract text from the last message
@@ -270,25 +255,21 @@ class LangGraphBridge(FrameProcessor):
                     if bot_response_text:
                         bot_response_text = str(bot_response_text).strip()
                 
-                # Send only the last message to TTS
+                # Send the last message to TTS
                 if bot_response_text:
-                    logger.info(f"📤 Sending last message to TTS: {bot_response_text[:100]}...")
                     await self.push_frame(LLMTextFrame(bot_response_text))
-                else:
-                    logger.warning("⚠️ No bot response found in final result messages")
                 
                 # Update state with final result
                 self.current_state.update(final_result)
                 
+                # Send final_result to webpage via data channel (non-blocking)
+                await self._send_final_result_to_webpage(final_result)
+                
             except Exception as e:
-                logger.error(f"❌ Error calling LangGraph: {e}", exc_info=True)
-                import traceback
-                logger.error(traceback.format_exc())
+                logger.error(f"Error calling LangGraph: {e}", exc_info=True)
             
         except Exception as e:
-            logger.error(f"❌ Error generating response: {e}", exc_info=True)
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"Error generating response: {e}", exc_info=True)
         finally:
             await self.push_frame(LLMFullResponseEndFrame())
 

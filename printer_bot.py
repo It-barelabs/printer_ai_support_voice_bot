@@ -119,7 +119,7 @@ async def run_bot(webrtc_connection):
     # llm = GoogleVertexLLMService(project_id="voice-document-builder", location="global")
     # llm = GeminiVertexBridge(project_id="voice-document-builder", location="global", model="gemini-2.5-flash", system_instruction=SYSTEM_INSTRUCTION)
 
-    bridge = LangGraphBridge(app=support_graph, thread_id="session_01", initial_state=initial_state)
+    bridge = LangGraphBridge(app=support_graph, thread_id="session_01", initial_state=initial_state, transport=pipecat_transport, webrtc_connection=webrtc_connection)
 
     system_content = "Start by greeting the user warmly and introducing yourself. use short response if possible and be friendly and helpful."
     # if printer_info:
