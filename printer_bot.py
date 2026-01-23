@@ -172,6 +172,14 @@ async def run_bot(webrtc_connection):
         logger.info(f"🔌 Transport type: {type(transport)}")
         logger.info(f"🔌 Client info: {client}")
 
+        # Send a greeting message via TTS when connecting
+        greeting_message = "Hello! I'm Easy Print, your printer support assistant. How can I help you today?"
+        await task.queue_frames([
+            LLMFullResponseStartFrame(),
+            LLMTextFrame(greeting_message),
+            LLMFullResponseEndFrame()
+        ])
+
         # Check if data channel exists
         if hasattr(transport, '_dc') and transport._dc:
             logger.info(f"✅ Data channel exists: {transport._dc}")
