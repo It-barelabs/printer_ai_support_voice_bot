@@ -9,3 +9,7 @@ wheels/
 # Virtual environments
 .venv
 .env
+chroma.sqlite3
+*.bin
+*.pdf
+*.pickle

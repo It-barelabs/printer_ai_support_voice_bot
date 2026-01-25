@@ -29,8 +29,9 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 from gemini_bridge import GeminiVertexBridge
 from langgraph_bridge import LangGraphBridge
-from support_graph import app as support_graph
+from agent_graph.printe_voice_support_grpah import VoiceSupportAgent
 import logging
+import uuid
 
 # Configure logging
 logging.getLogger("pipecat.transports.smallwebrtc").setLevel(logging.WARNING)
@@ -65,9 +66,11 @@ from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContextFr
 
 
 
-async def run_bot(webrtc_connection):
+async def run_bot(webrtc_connection, collection_name: str = None):
     logger.info("🚀 Starting bot with WebRTC connection")
     logger.info(f"🔧 WebRTC connection ID: {webrtc_connection.pc_id}")
+    if collection_name:
+        logger.info(f"🖨️ Using collection: {collection_name}")
 
     # if printer_info:
     #     logger.info(f"🖨️ Printer info received: {printer_info}")
@@ -119,7 +122,24 @@ async def run_bot(webrtc_connection):
     # llm = GoogleVertexLLMService(project_id="voice-document-builder", location="global")
     # llm = GeminiVertexBridge(project_id="voice-document-builder", location="global", model="gemini-2.5-flash", system_instruction=SYSTEM_INSTRUCTION)
 
-    bridge = LangGraphBridge(app=support_graph, thread_id="session_01", initial_state=initial_state, transport=pipecat_transport, webrtc_connection=webrtc_connection)
+    # Create VoiceSupportAgent instance with collection_name
+    default_collection = collection_name or "HP_Color_LaserJet"
+    agent = VoiceSupportAgent(
+        persist_dir="chroma_store",
+        collection_name=default_collection
+    )
+    
+    # Generate a unique UUID for this session thread
+    session_id = str(uuid.uuid4())
+    logger.info(f"📝 Generated session ID: {session_id}")
+    
+    bridge = LangGraphBridge(
+        app=agent,
+        thread_id=session_id,  # Use generated UUID as thread_id
+        transport=pipecat_transport,
+        webrtc_connection=webrtc_connection,
+        collection_name=default_collection
+    )
 
     system_content = "Start by greeting the user warmly and introducing yourself. use short response if possible and be friendly and helpful."
     # if printer_info:
@@ -173,7 +193,7 @@ async def run_bot(webrtc_connection):
         logger.info(f"🔌 Client info: {client}")
 
         # Send a greeting message via TTS when connecting
-        greeting_message = "Hello! I'm Easy Print, your printer support assistant. How can I help you today?"
+        greeting_message = "Hi there! Its me Easy print."
         await task.queue_frames([
             LLMFullResponseStartFrame(),
             LLMTextFrame(greeting_message),

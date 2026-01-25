@@ -38,16 +38,29 @@ app = FastAPI(lifespan=lifespan)
 
 
 @app.post("/api/offer")
-async def offer(request: SmallWebRTCRequest, background_tasks: BackgroundTasks, printer_info: Optional[str] = None):
+async def offer(request: Request, background_tasks: BackgroundTasks):
     """Handle WebRTC offer requests via SmallWebRTCRequestHandler."""
-
+    
+    # Parse the request body to extract collection_name
+    body = await request.json()
+    collection_name = body.get("collection_name")
+    
+    # Create SmallWebRTCRequest from the body (without collection_name)
+    webrtc_request = SmallWebRTCRequest(
+        sdp=body.get("sdp"),
+        type=body.get("type")
+    )
+    
     # Prepare runner arguments with the callback to run your bot
     async def webrtc_connection_callback(connection):
-        background_tasks.add_task(run_bot, connection)
+        logger.info(f"WebRTC connection established: {connection.pc_id}")
+        if collection_name:
+            logger.info(f"Using collection: {collection_name}")
+        background_tasks.add_task(run_bot, connection, collection_name)
 
     # Delegate handling to SmallWebRTCRequestHandler
     answer = await small_webrtc_handler.handle_web_request(
-        request=request,
+        request=webrtc_request,
         webrtc_connection_callback=webrtc_connection_callback,
     )
     return answer

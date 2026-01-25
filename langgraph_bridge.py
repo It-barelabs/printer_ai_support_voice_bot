@@ -16,24 +16,38 @@ logging.getLogger("pipecat.transports.smallwebrtc").setLevel(logging.WARNING)
 
 
 class LangGraphBridge(FrameProcessor):
-    def __init__(self, app, thread_id: str, initial_state: dict = None, transport=None, webrtc_connection=None):
+    def __init__(
+        self, 
+        app, 
+        thread_id: str, 
+        initial_state: dict = None, 
+        transport=None, 
+        webrtc_connection=None,
+        collection_name: str = None
+    ):
         super().__init__()
-        self.app = app
+        # Handle both class and instance - if class, raise helpful error
+        if isinstance(app, type):
+            raise ValueError(
+                "LangGraphBridge requires an instance of VoiceSupportAgent, not the class. "
+                "Please instantiate it first: VoiceSupportAgent(persist_dir='...', collection_name='...')"
+            )
+        self.app = app  # This should be a VoiceSupportAgent instance
         self.thread_id = thread_id
         self.config = {"configurable": {"thread_id": thread_id}}
         self.transport = transport
         self.webrtc_connection = webrtc_connection
-        # Initialize current_state with the provided initial_state or default
+        self.collection_name = collection_name
+        
+        # Initialize current_state with the provided initial_state or default for VoiceSupportAgent
         self.current_state = initial_state or {
             "messages": [],
-            "topic": "",
-            "tone": "",
-            "audience": "",
-            "word_count": 0,
-            "thesis_statement": "",
-            "outline": "",
-            "final_draft": "",
-            "current_stage": "intake"
+            "printer_slots": None,
+            "collection_name": collection_name or "",
+            "missing_info": [],
+            "dialogue_phase": "gathering",
+            "retrieved_docs": [],
+            "answer": ""
         }
 
     def _extract_text_from_message(self, message):
@@ -75,15 +89,15 @@ class LangGraphBridge(FrameProcessor):
         
         return None
 
-    def _convert_context_to_langgraph_state(self, context):
+    def _extract_user_input_from_context(self, context):
         """
-        Convert context to LangGraph state format.
+        Extract user input text from context for VoiceSupportAgent.
         
         Returns:
-            Tuple of (state dict, has_user_message)
+            Tuple of (user_input string, has_user_message bool)
         """
-        state = self.current_state.copy()
         has_user_message = False
+        user_input = None
         
         # Get messages from context
         context_messages = []
@@ -93,12 +107,12 @@ class LangGraphBridge(FrameProcessor):
             context_messages = context._messages
         
         if not context_messages:
-            return state, False
+            return None, False
         
         # Get the last message
         last_msg = context_messages[-1] if context_messages else None
         if not last_msg:
-            return state, False
+            return None, False
         
         # Extract role and content
         role = None
@@ -114,14 +128,9 @@ class LangGraphBridge(FrameProcessor):
         # Only process user messages
         if role == "user" and content:
             has_user_message = True
-            # Add user message to state
-            current_messages = state.get("messages", [])
-            if isinstance(current_messages, list):
-                state["messages"] = current_messages + [content]
-            else:
-                state["messages"] = [content]
+            user_input = content
         
-        return state, has_user_message
+        return user_input, has_user_message
 
     def _format_final_result_for_display(self, final_result):
         """Format final_result dict as a readable string for display."""
@@ -164,11 +173,15 @@ class LangGraphBridge(FrameProcessor):
                 ]
             elif isinstance(value, dict):
                 serializable_result[key] = {k: str(v) for k, v in value.items()}
+            elif hasattr(value, 'model_dump'):  # Pydantic model
+                serializable_result[key] = value.model_dump()
+            elif hasattr(value, 'dict'):  # Pydantic model (older API)
+                serializable_result[key] = value.dict()
             else:
                 serializable_result[key] = str(value)
         
         try:
-            return json.dumps(serializable_result, indent=2)
+            return json.dumps(serializable_result, indent=2, default=str)
         except Exception as e:
             logger.error(f"Error serializing final_result: {e}")
             return str(serializable_result)
@@ -210,8 +223,8 @@ class LangGraphBridge(FrameProcessor):
 
     async def _process_context(self, context):
         """
-        Process a context and generate a response.
-        Only the last message from the final result dict is sent to TTS.
+        Process a context and generate a response using VoiceSupportAgent.
+        The answer field from the response is sent to TTS.
         
         Args:
             context: The LLM context containing conversation history
@@ -219,45 +232,75 @@ class LangGraphBridge(FrameProcessor):
         await self.push_frame(LLMFullResponseStartFrame())
         
         try:
-            # Convert context to LangGraph state
-            state, has_user_message = self._convert_context_to_langgraph_state(context)
+            # Extract user input from context
+            user_input, has_user_message = self._extract_user_input_from_context(context)
             
-            if not has_user_message:
+            if not has_user_message or not user_input:
                 await self.push_frame(LLMFullResponseEndFrame())
                 return
             
-            # Update current state
-            self.current_state = state
-            
-            # Get final result from LangGraph
+            # Call VoiceSupportAgent.invoke() method
             try:
-                if hasattr(self.app, 'ainvoke'):
-                    final_result = await self.app.ainvoke(state, self.config)
+                # Check if app has invoke method (VoiceSupportAgent) or is a graph (direct LangGraph)
+                if hasattr(self.app, 'invoke'):
+                    # VoiceSupportAgent interface
+                    if hasattr(self.app, 'ainvoke'):
+                        # Async version if available
+                        final_result = await self.app.ainvoke(
+                            user_input=user_input,
+                            session_id=self.thread_id,
+                            collection_name=self.collection_name
+                        )
+                    else:
+                        # Sync version - run in thread
+                        final_result = await asyncio.to_thread(
+                            self.app.invoke,
+                            user_input=user_input,
+                            session_id=self.thread_id,
+                            collection_name=self.collection_name
+                        )
                 else:
-                    final_result = await asyncio.to_thread(self.app.invoke, state, self.config)
+                    # Direct LangGraph app (fallback for compatibility)
+                    # Convert context to state format
+                    state = self.current_state.copy()
+                    state["messages"] = state.get("messages", []) + [user_input]
+                    
+                    if hasattr(self.app, 'ainvoke'):
+                        final_result = await self.app.ainvoke(state, self.config)
+                    else:
+                        final_result = await asyncio.to_thread(self.app.invoke, state, self.config)
                 
-                # Extract the last message from the messages list for TTS
+                # Extract bot response text
                 bot_response_text = None
-                if "messages" in final_result and final_result["messages"]:
-                    messages = final_result["messages"]
-                    last_msg = messages[-1]
-                    
-                    # Extract text from the last message
-                    if isinstance(last_msg, AIMessage) and last_msg.content:
-                        bot_response_text = last_msg.content
-                    elif isinstance(last_msg, str):
-                        bot_response_text = last_msg
-                    elif hasattr(last_msg, "content"):
-                        bot_response_text = str(last_msg.content)
-                    elif isinstance(last_msg, dict):
-                        bot_response_text = last_msg.get("content", "")
-                    
-                    if bot_response_text:
-                        bot_response_text = str(bot_response_text).strip()
                 
-                # Send the last message to TTS
+                # First, try to get answer field (VoiceSupportAgent returns this)
+                if "answer" in final_result and final_result["answer"]:
+                    bot_response_text = str(final_result["answer"]).strip()
+                
+                # Fallback: Extract from messages list
+                if not bot_response_text and "messages" in final_result and final_result["messages"]:
+                    messages = final_result["messages"]
+                    # Find the last AIMessage
+                    for msg in reversed(messages):
+                        if isinstance(msg, AIMessage) and msg.content:
+                            bot_response_text = str(msg.content).strip()
+                            break
+                        elif isinstance(msg, str):
+                            bot_response_text = str(msg).strip()
+                            break
+                        elif hasattr(msg, "content"):
+                            bot_response_text = str(msg.content).strip()
+                            break
+                        elif isinstance(msg, dict):
+                            bot_response_text = str(msg.get("content", "")).strip()
+                            if bot_response_text:
+                                break
+                
+                # Send the response to TTS
                 if bot_response_text:
                     await self.push_frame(LLMTextFrame(bot_response_text))
+                else:
+                    logger.warning("No bot response text found in final_result")
                 
                 # Update state with final result
                 self.current_state.update(final_result)
@@ -266,7 +309,7 @@ class LangGraphBridge(FrameProcessor):
                 await self._send_final_result_to_webpage(final_result)
                 
             except Exception as e:
-                logger.error(f"Error calling LangGraph: {e}", exc_info=True)
+                logger.error(f"Error calling VoiceSupportAgent: {e}", exc_info=True)
             
         except Exception as e:
             logger.error(f"Error generating response: {e}", exc_info=True)

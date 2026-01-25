@@ -29,9 +29,13 @@
 <body>
     <h1>WebRTC Voice Agent</h1>
     <p id="status">Disconnected</p>
-    <!-- <div style="margin: 20px 0;">
-        <textarea id="printer-info" placeholder="Enter printer information here..." rows="4" style="width: 100%; max-width: 500px; padding: 10px; border-radius: 5px; border: 1px solid #ccc;"></textarea>
-    </div> -->
+    <div style="margin: 20px 0;">
+        <label for="collection-name" style="display: block; margin-bottom: 8px; font-weight: bold;">Printer Collection:</label>
+        <select id="collection-name" style="width: 100%; max-width: 500px; padding: 10px; border-radius: 5px; border: 1px solid #ccc; font-size: 16px;">
+            <option value="Canon_MF753Cdw">Canon MF753Cdw</option>
+            <option value="HP_Color_LaserJet">HP Color LaserJet</option>
+        </select>
+    </div>
     <button id="connect-btn">Connect</button>
     <audio id="audio-el" autoplay></audio>
     <div id="transcripts-container" style="display: none;">
@@ -52,7 +56,7 @@
     <script>
         const statusEl = document.getElementById("status")
         const buttonEl = document.getElementById("connect-btn")
-        // const printerInfoEl = document.getElementById("printer-info")
+        const collectionNameEl = document.getElementById("collection-name")
         const audioEl = document.getElementById("audio-el")
         const transcriptsEl = document.getElementById("transcripts")
         const transcriptsContainer = document.getElementById("transcripts-container")
@@ -254,16 +258,15 @@
             const offer = pc.localDescription
             console.log('📤 Sending offer to server...');
             
-            // const printerInfo = printerInfoEl.value;
-            let url = '/api/offer';
-            // if (printerInfo) {
-            //     const params = new URLSearchParams();
-            //     params.append('printer_info', printerInfo);
-            //     url += `?${params.toString()}`;
-            // }
+            const collectionName = collectionNameEl.value;
+            const requestBody = {
+                sdp: offer.sdp,
+                type: offer.type,
+                collection_name: collectionName
+            };
 
-            const response = await fetch(url, {
-                body: JSON.stringify({ sdp: offer.sdp, type: offer.type}),
+            const response = await fetch('/api/offer', {
+                body: JSON.stringify(requestBody),
                 headers: { 'Content-Type': 'application/json' },
                 method: 'POST',
             });
@@ -358,6 +361,7 @@
             statusEl.textContent = "Connecting"
             statusEl.style.color = 'blue'
             buttonEl.textContent = "Disconnect"
+            collectionNameEl.disabled = true
             connected = true
         }
 
@@ -365,6 +369,7 @@
             statusEl.textContent = "Connected"
             statusEl.style.color = 'green'
             buttonEl.textContent = "Disconnect"
+            collectionNameEl.disabled = true
             connected = true
         }
 
@@ -372,6 +377,7 @@
             statusEl.textContent = "Disconnected"
             statusEl.style.color = 'black'
             buttonEl.textContent = "Connect"
+            collectionNameEl.disabled = false
             connected = false
             if (peerConnection) {
                 peerConnection = null
